@@ -1,5 +1,4 @@
-# Build outputs
-Assemblies/
+# Build outputs (keep Assemblies/ for distribution)
 Source/bin/
 Source/obj/
 
