@@ -1,0 +1,17 @@
+# Build outputs
+Assemblies/
+Source/bin/
+Source/obj/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+
+# NuGet
+packages/
+*.nuget.props
+*.nuget.targets
+project.assets.json
+
