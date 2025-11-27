@@ -6,9 +6,34 @@
   <supportedVersions>
     <li>1.6</li>
   </supportedVersions>
-  <description>
-    Cleans up orphaned verbs when pawns are drafted to prevent auto-attack errors (EffectiveRange NREs). Includes a lightweight safety guard to avoid crashes if a bad verb appears mid-tick.
-  </description>
+  <description>Automatically cleans up orphaned verbs when pawns are drafted to prevent auto-attack errors and NullReferenceExceptions.
+
+How It Works:
+Draft Verb Sanitizer uses Harmony patches to intercept draft state changes and combat system calls, then performs targeted cleanup on verb trackers. It removes verbs that reference destroyed equipment, removed hediffs, or deactivated abilities. The mod also includes multiple safety guards to prevent NREs in AdjustedRange calculations, hostility response, and melee verb selection.
+
+Safety:
+- All operations are wrapped in comprehensive try/catch blocks
+- Each patch operates independently; failures are isolated
+- No modifications to core game logic or data structures
+- Read-only operations where possible; deletions only remove invalid entries
+- Reflection calls are cached and include null checks
+
+Performance:
+- Runs only on draft toggle (user action, not every tick)
+- Reflection calls are cached for efficiency
+- Minimal overhead: typically completes in &lt;1ms per pawn
+- HashSet-based O(1) lookups instead of O(n) list searches
+- In-place removal eliminates unnecessary allocations
+
+Features:
+- Draft Toggle Sanitization: Removes orphaned verbs when drafting/undrafting
+- AdjustedRange Guard: Prevents NREs in range calculations with Priority.First
+- HostilityResponse Guard: Validates verbs before hostility response logic runs
+- Melee Verb Suppression: Suppresses "has no available melee attack" ErrorOnce spam
+- Melee Gizmo Safety: Prevents creating gizmos when no melee verbs exist
+- MVCF Integration: Automatically refreshes MVCF verb managers when present
+
+All features work automatically with zero configuration.</description>
   <modDependencies>
     <li>
       <packageId>brrainz.harmony</packageId>
@@ -22,4 +47,3 @@
     <li>OskarPotocki.VFECore</li>
   </loadAfter>
 </ModMetaData>
-
