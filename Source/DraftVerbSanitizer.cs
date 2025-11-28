@@ -14,403 +14,246 @@ namespace DraftVerbSanitizer
     {
         static Startup()
         {
-            new Harmony("celphcs30.draftverbsanitizer").PatchAll();
+            var harmony = new Harmony("celphcs30.draftverbsanitizer");
+            harmony.PatchAll();
+            LogHarmonyPatches();
         }
-    }
 
-    // Run sanitizer whenever player toggles drafted state.
-    [HarmonyPatch(typeof(Pawn_DraftController), "Drafted", MethodType.Setter)]
-    public static class Patch_DraftedSetter
-    {
-        public static void Postfix(Pawn_DraftController __instance)
+        static void LogHarmonyPatches()
         {
-            var pawn = __instance?.pawn;
-            if (pawn == null) return;
-
-            VerbSanitizer.TrySanitize(pawn, out _);
-        }
-    }
-
-    // Soft guard: if a bad verb reaches AdjustedRange, return a safe value instead of throwing.
-    [HarmonyPatch(typeof(VerbProperties), nameof(VerbProperties.AdjustedRange))]
-    [HarmonyPriority(Priority.First)]
-    public static class Patch_AdjustedRangeGuard
-    {
-        public static bool Prefix(Verb ownerVerb, Thing attacker, ref float __result)
-        {
-            // Keep this cheap; no try/catch on hot path.
-            if (ownerVerb == null || ownerVerb.verbProps == null)
+            try
             {
-                __result = 1f;
-                return false;
-            }
-
-            // If caster/attacker are null, skip original to avoid NREs in downstream code.
-            if (ownerVerb.CasterPawn == null || attacker == null)
-            {
-                // Fall back to the raw verb range or 1.
-                __result = Math.Max(1f, ownerVerb.verbProps.range);
-                return false;
-            }
-
-            return true; // run original
-        }
-    }
-
-    // Prevent NRE in HostilityResponse when verbs are invalid
-    [HarmonyPatch(typeof(JobGiver_ConfigurableHostilityResponse), "TryGetAttackNearbyEnemyJob")]
-    [HarmonyPriority(Priority.First)]
-    [HarmonyBefore("OskarPotocki.VEF", "legodude17.mvcf")]
-    public static class Patch_HostilityResponse_Safety
-    {
-        public static bool Prefix(Pawn pawn, ref Job __result)
-        {
-            // Bail fast if pawn is not actionable
-            if (pawn == null || pawn.Destroyed || pawn.Dead)
-            {
-                __result = null;
-                return false;
-            }
-
-            // Try to sanitize orphaned/bad verbs first
-            VerbSanitizer.TrySanitize(pawn, out _);
-
-            // If verbTracker is gone or no verbs, skip running the original (and modded) logic
-            var vt = pawn.verbTracker;
-            var verbs = vt?.AllVerbs;
-            if (verbs == null || verbs.Count == 0)
-            {
-                __result = null;
-                return false;
-            }
-
-            // Ensure at least one usable attack verb exists before proceeding
-            bool hasUsable = false;
-            for (int i = 0; i < verbs.Count; i++)
-            {
-                var v = verbs[i];
-                if (v == null || v.verbProps == null) continue;
-                // Available() is safe; our AdjustedRange guard prevents null-related crashes on hot path.
-                // Check if it's an attack verb (melee or ranged)
-                if (v.Available() && v.verbProps.violent)
+                var methods = new[]
                 {
-                    hasUsable = true;
-                    break;
+                    typeof(JobGiver_ConfigurableHostilityResponse).GetMethod("TryGetAttackNearbyEnemyJob"),
+                    typeof(Pawn_MeleeVerbs).GetMethod("TryGetMeleeVerb"),
+                    typeof(Pawn_MeleeVerbs).GetMethod("ChooseMeleeVerb"),
+                    typeof(PawnAttackGizmoUtility).GetMethod("GetMeleeAttackGizmo")
+                };
+
+                foreach (var method in methods)
+                {
+                    if (method == null) continue;
+                    var patches = Harmony.GetPatchInfo(method);
+                    if (patches == null) continue;
+
+                    var owners = new HashSet<string>();
+                    if (patches.Prefixes != null) foreach (var p in patches.Prefixes) owners.Add(p.owner);
+                    if (patches.Postfixes != null) foreach (var p in patches.Postfixes) owners.Add(p.owner);
+                    if (patches.Transpilers != null) foreach (var p in patches.Transpilers) owners.Add(p.owner);
+                    if (patches.Finalizers != null) foreach (var p in patches.Finalizers) owners.Add(p.owner);
+
+                    Log.Message($"[DVS] {method.DeclaringType?.Name}.{method.Name} patches: {string.Join(", ", owners)}");
                 }
             }
-
-            if (!hasUsable)
-            {
-                __result = null;
-                return false;
-            }
-
-            // let original (and other patches) run
-            return true;
+            catch { }
         }
     }
 
-    // Suppress "has no available melee attack" spam
-    [HarmonyPatch(typeof(Pawn_MeleeVerbs), "TryGetMeleeVerb")]
-    [HarmonyPriority(Priority.First)]
-    [HarmonyBefore("OskarPotocki.VEF", "legodude17.mvcf")]
-    public static class Patch_TryGetMeleeVerb_SuppressError
+    // Runs once per load/new game and sanitizes every pawn by forcing a verb rebuild.
+    public class DVS_GameComponent : GameComponent
     {
-        static readonly MethodInfo GetList = FindGetUpdatedVerbListMethod();
-        static readonly FieldInfo PawnField = AccessTools.Field(typeof(Pawn_MeleeVerbs), "pawn");
+        private bool ranThisLoad;
 
-        internal static MethodInfo FindGetUpdatedVerbListMethod()
+        public DVS_GameComponent(Game game) { }
+
+        public override void ExposeData()
         {
-            var type = typeof(Pawn_MeleeVerbs);
-            var methods = AccessTools.GetDeclaredMethods(type)
-                .Concat(type.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
-                .Where(m => m != null && m.Name.IndexOf("GetUpdated", StringComparison.OrdinalIgnoreCase) >= 0)
-                .Where(m =>
-                {
-                    var returnType = m.ReturnType;
-                    if (returnType == typeof(List<Verb>) || 
-                        (returnType.IsGenericType && returnType.GetGenericTypeDefinition() == typeof(IEnumerable<>)))
-                    {
-                        var genArgs = returnType.GetGenericArguments();
-                        if (genArgs.Length == 1 && genArgs[0] == typeof(Verb))
-                        {
-                            var parms = m.GetParameters();
-                            return parms.Length == 0 || (parms.Length == 1 && parms[0].ParameterType == typeof(bool));
-                        }
-                    }
-                    return false;
-                })
-                .ToList();
+            base.ExposeData();
+            Scribe_Values.Look(ref ranThisLoad, "DVS_ranThisLoad", false);
 
-            return methods.FirstOrDefault();
+            // Post-load-init is the safe point where everything exists.
+            if (Scribe.mode == LoadSaveMode.PostLoadInit && !ranThisLoad)
+            {
+                Log.Message("[DVS] ExposeData: PostLoadInit detected, scheduling sanitize");
+                ScheduleSanitize("PostLoadInit");
+            }
         }
 
-        static bool Prefix(Pawn_MeleeVerbs __instance, Thing target, ref Verb __result)
+        public override void FinalizeInit()
         {
-            if (__instance == null)
-            {
-                __result = null;
-                return false;
-            }
+            base.FinalizeInit();
 
-            // Get pawn via reflection (may be private field)
-            Pawn pawn = null;
-            if (PawnField != null)
+            // New game path (no load), run once.
+            if (!ranThisLoad)
             {
-                try
+                Log.Message("[DVS] FinalizeInit: New game detected, scheduling sanitize");
+                ScheduleSanitize("FinalizeInit");
+            }
+        }
+
+        private void ScheduleSanitize(string reason)
+        {
+            ranThisLoad = true;
+            LongEventHandler.QueueLongEvent(
+                () => RunSanitizeAllPawns(reason),
+                "DVS_SanitizingVerbs",
+                doAsynchronously: false,
+                null);
+        }
+
+        private void RunSanitizeAllPawns(string reason)
+        {
+            int total = 0;
+            int rebuilt = 0;
+
+            try
+            {
+                var seen = new HashSet<int>();
+
+                // Maps (spawned pawns)
+                foreach (var map in Find.Maps)
                 {
-                    pawn = PawnField.GetValue(__instance) as Pawn;
-                }
-                catch { }
-            }
-
-            if (pawn == null || pawn.Dead || pawn.Destroyed)
-            {
-                __result = null;
-                return false;
-            }
-
-            // Keep verbs sane first; cheap and main-thread safe
-            VerbSanitizer.TrySanitize(pawn, out _);
-
-            // Check for available melee verbs - if we can't find any, return null to suppress ErrorOnce spam
-            bool hasVerbs = false;
-            
-            // Try the robust method first
-            if (GetList != null)
-            {
-                try
-                {
-                    var parms = GetList.GetParameters();
-                    var listObj = parms.Length == 1
-                        ? GetList.Invoke(__instance, new object[] { false })
-                        : GetList.Invoke(__instance, null);
-
-                    if (listObj is IEnumerable<Verb> verbEnum)
+                    foreach (var p in map.mapPawns.AllPawns)
                     {
-                        hasVerbs = verbEnum.Any();
+                        if (p == null) continue;
+                        if (!seen.Add(p.thingIDNumber)) continue;
+                        total++;
+                        if (VerbSanitizer.RebuildVerbs(p)) rebuilt++;
                     }
                 }
-                catch
-                {
-                    // Reflection failed, will try fallback
-                }
-            }
 
-            // Fallback: check verbTracker directly for melee verbs
-            if (!hasVerbs)
-            {
-                try
+                // World pawns (caravans, etc.)
+                if (Find.World != null)
                 {
-                    var vt = pawn.verbTracker;
-                    if (vt != null)
+                    foreach (var p in Find.WorldPawns.AllPawnsAliveOrDead) // include downed/away pawns
                     {
-                        var allVerbs = vt.AllVerbs;
-                        if (allVerbs != null)
-                        {
-                            // Check for any melee attack verbs
-                            hasVerbs = allVerbs.Any(v => v != null && v.IsMeleeAttack && v.verbProps != null);
-                        }
+                        if (p == null) continue;
+                        if (!seen.Add(p.thingIDNumber)) continue;
+                        total++;
+                        if (VerbSanitizer.RebuildVerbs(p)) rebuilt++;
                     }
                 }
-                catch
-                {
-                    // If we can't check, assume no verbs to suppress error
-                    hasVerbs = false;
-                }
-            }
 
-            // If no melee verbs found, return null to suppress the ErrorOnce
-            if (!hasVerbs)
+                Log.Message($"[DVS] On {reason}: inspected {total} pawns, rebuilt verb caches for {rebuilt}.");
+            }
+            catch (Exception e)
             {
-                __result = null;
-                return false;
+                Log.Warning($"[DVS] Sanitize failed: {e}");
             }
-
-            return true; // proceed to original method
         }
     }
 
-    // Prevent asking for a melee gizmo when none exists
-    [HarmonyPatch(typeof(PawnAttackGizmoUtility), nameof(PawnAttackGizmoUtility.GetMeleeAttackGizmo))]
-    [HarmonyPriority(Priority.First)]
-    public static class Patch_GetMeleeAttackGizmo_Safety
-    {
-        static readonly MethodInfo GetList = Patch_TryGetMeleeVerb_SuppressError.FindGetUpdatedVerbListMethod();
-
-        static bool Prefix(Pawn pawn, ref Gizmo __result)
-        {
-            if (pawn == null || pawn.Dead || pawn.Downed)
-            {
-                __result = null;
-                return false;
-            }
-
-            // If the pawn clearly has no melee verbs, skip creating the gizmo.
-            // This is conservative: if we can't determine, we let original proceed.
-            var pmv = pawn.meleeVerbs;
-            if (pmv == null)
-            {
-                __result = null;
-                return false;
-            }
-
-            // Try to avoid calling into ChooseMeleeVerb; it's already guarded above,
-            // but this short-circuits earlier and saves work.
-            if (GetList != null)
-            {
-                try
-                {
-                    var parms = GetList.GetParameters();
-                    var listObj = parms.Length == 1
-                        ? GetList.Invoke(pmv, new object[] { false })
-                        : GetList.Invoke(pmv, null);
-
-                    if (listObj is IEnumerable<Verb> verbEnum)
-                    {
-                        if (!verbEnum.Any())
-                        {
-                            __result = null;
-                            return false;
-                        }
-                    }
-                }
-                catch
-                {
-                    // If we can't check, let the original run and rely on the suppression above.
-                }
-            }
-
-            return true; // proceed to original
-        }
-    }
-
+    // Note: No patches on Draft toggle, no HostilityResponse finalizers, no AdjustedRange guards here.
     public static class VerbSanitizer
     {
-        // Cache reflection for ability property lookup
-        private static readonly PropertyInfo CachedAbilityProperty = AccessTools.Property(typeof(Verb), "ability");
-
-        public static bool TrySanitize(Pawn pawn, out int removed)
+        // Force a rebuild of the pawn's verbs by clearing AllVerbs and letting RimWorld rebuild.
+        public static bool RebuildVerbs(Pawn pawn)
         {
-            removed = 0;
             if (pawn == null || pawn.Destroyed) return false;
-
             var vt = pawn.verbTracker;
             if (vt == null) return false;
 
-            List<Verb> list;
             try
             {
-                list = vt.AllVerbs;
-            }
-            catch
-            {
-                return false;
-            }
-            if (list == null || list.Count == 0) return false;
-
-            var eq = pawn.equipment?.AllEquipmentListForReading;
-            var hediffs = pawn.health?.hediffSet?.hediffs;
-            var abilities = pawn.abilities?.abilities;
-
-            // HashSets for O(1) membership checks; default reference equality is correct here.
-            HashSet<ThingWithComps> eqSet = (eq != null && eq.Count > 0) ? new HashSet<ThingWithComps>(eq) : null;
-            HashSet<Hediff> hediffSet = (hediffs != null && hediffs.Count > 0) ? new HashSet<Hediff>(hediffs) : null;
-            HashSet<Ability> abilitySet = (abilities != null && abilities.Count > 0) ? new HashSet<Ability>(abilities) : null;
-
-            // Remove in-place, iterating backwards to avoid index shifting.
-            for (int i = list.Count - 1; i >= 0; i--)
-            {
-                var v = list[i];
-                if (ShouldCull(v, pawn, eqSet, hediffSet, abilitySet))
+                // Try multiple approaches to force verb rebuild
+                var vtType = vt.GetType();
+                
+                // Approach 1: Try to find and clear a cached field
+                var fields = vtType.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                bool foundCache = false;
+                foreach (var f in fields)
                 {
-                    list.RemoveAt(i);
-                    removed++;
+                    // Look for fields that might be caches (List<Verb>, Verb[], etc.)
+                    if (f.FieldType == typeof(List<Verb>) || 
+                        (f.FieldType.IsGenericType && f.FieldType.GetGenericTypeDefinition() == typeof(List<>)))
+                    {
+                        var list = f.GetValue(vt) as List<Verb>;
+                        if (list != null && list.Count > 0)
+                        {
+                            // Found a verb list - clear it to force rebuild
+                            list.Clear();
+                            foundCache = true;
+                            Log.Message($"[DVS] Cleared cache field '{f.Name}' for {pawn.LabelShortCap}");
+                        }
+                    }
+                }
+                
+                // Approach 2: Try to find a method that rebuilds verbs
+                var rebuildMethods = vtType.GetMethods(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+                    .Where(m => m.Name.Contains("Rebuild") || m.Name.Contains("Refresh") || m.Name.Contains("Update"))
+                    .Where(m => m.GetParameters().Length == 0)
+                    .ToList();
+                
+                foreach (var m in rebuildMethods)
+                {
+                    try
+                    {
+                        m.Invoke(vt, null);
+                        Log.Message($"[DVS] Called rebuild method '{m.Name}' for {pawn.LabelShortCap}");
+                        foundCache = true;
+                        break;
+                    }
+                    catch { }
+                }
+                
+                // Approach 3: Directly clear AllVerbs if it's a List we can modify
+                var allVerbs = vt.AllVerbs;
+                if (allVerbs != null && allVerbs.Count > 0)
+                {
+                    // Try to clear the list - this will force RimWorld to rebuild
+                    allVerbs.Clear();
+                    foundCache = true;
+                    Log.Message($"[DVS] Cleared AllVerbs list for {pawn.LabelShortCap}");
+                }
+
+                if (foundCache)
+                {
+                    // Clear any stance that might be using an old verb ref.
+                    pawn.stances?.CancelBusyStanceSoft();
+                    TryRefreshMVCF(pawn);
+                    return true;
+                }
+                else
+                {
+                    Log.Warning($"[DVS] Could not find way to rebuild verbs for {pawn.LabelShortCap}");
                 }
             }
-
-            if (removed > 0)
+            catch (Exception e)
             {
-                pawn.stances?.CancelBusyStanceSoft();
-                TryRefreshMVCF_Cached(pawn);
-                // Optional: Log.Message($"[DVS] Removed {removed} orphaned verb(s) from {pawn.LabelShortCap}");
+                Log.Warning($"[DVS] RebuildVerbs failed for {pawn?.LabelShortCap ?? "null"}: {e.Message}");
             }
-
-            return true;
-        }
-
-        static bool ShouldCull(Verb v, Pawn pawn,
-            HashSet<ThingWithComps> eq,
-            HashSet<Hediff> hediffs,
-            HashSet<Ability> abilities)
-        {
-            if (v == null) return true;
-            if (v.verbProps == null) return true;
-
-            // Must belong to this pawn.
-            if (v.CasterPawn == null || v.CasterPawn != pawn) return true;
-
-            // Equipment verb orphaned?
-            var srcEq = v.EquipmentSource;
-            if (srcEq != null && (eq == null || !eq.Contains(srcEq))) return true;
-
-            // Hediff verb orphaned?
-            var srcHediff = v.HediffCompSource?.parent;
-            if (srcHediff != null && (hediffs == null || !hediffs.Contains(srcHediff))) return true;
-
-            // Ability verb orphaned? (use cached reflection)
-            Ability srcAbility = null;
-            if (CachedAbilityProperty != null)
-            {
-                try
-                {
-                    srcAbility = CachedAbilityProperty.GetValue(v) as Ability;
-                }
-                catch { }
-            }
-            if (srcAbility != null && (abilities == null || !abilities.Contains(srcAbility))) return true;
-
-            // If owner is null and none of the above matched, still cull.
-            if (v.verbTracker == null) return true;
 
             return false;
         }
 
-        // Cached MVCF reflection helpers.
-        static class MVCFCache
-        {
-            public static readonly Type UtilType =
-                AccessTools.TypeByName("MVCF.Utilities.VerbManagerUtility")
-                ?? AccessTools.TypeByName("MVCF.Utilities.Utilities");
-
-            public static readonly MethodInfo TryGetManager =
-                UtilType != null ? AccessTools.Method(UtilType, "TryGetManager", new[] { typeof(Pawn) }) : null;
-
-            static readonly Dictionary<Type, MethodInfo> RecalcCache = new Dictionary<Type, MethodInfo>();
-
-            public static void TryRecalculate(object mgr)
-            {
-                if (mgr == null) return;
-
-                var t = mgr.GetType();
-                if (!RecalcCache.TryGetValue(t, out var m))
-                {
-                    m = AccessTools.Method(t, "RecalculateVerbs");
-                    RecalcCache[t] = m;
-                }
-
-                m?.Invoke(mgr, null);
-            }
-        }
-
-        static void TryRefreshMVCF_Cached(Pawn pawn)
+        // MVCF compatibility: ask its manager to recalc after we invalidate verb cache.
+        private static void TryRefreshMVCF(Pawn pawn)
         {
             try
             {
-                if (MVCFCache.TryGetManager == null) return;
+                var util =
+                    AccessTools.TypeByName("MVCF.Utilities.VerbManagerUtility") ??
+                    AccessTools.TypeByName("MVCF.Utilities.Utilities");
+                if (util == null) return;
 
-                var mgr = MVCFCache.TryGetManager.Invoke(null, new object[] { pawn });
-                MVCFCache.TryRecalculate(mgr);
+                // TryGetManager(Pawn, out Manager) – method signature varies across MVCF versions.
+                var tryGet = util
+                    .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                    .FirstOrDefault(m =>
+                    {
+                        if (m.Name != "TryGetManager") return false;
+                        var ps = m.GetParameters();
+                        return ps.Length == 2 &&
+                               ps[0].ParameterType == typeof(Pawn) &&
+                               ps[1].ParameterType.IsByRef;
+                    });
+
+                if (tryGet == null) return;
+
+                var args = new object[] { pawn, null };
+                bool ok = tryGet.Invoke(null, args) as bool? ?? false;
+                if (!ok) return;
+
+                var mgr = args[1];
+                if (mgr == null) return;
+
+                // RecalculateVerbs/Recalculate depending on MVCF build.
+                var recalc =
+                    mgr.GetType().GetMethod("RecalculateVerbs", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic) ??
+                    mgr.GetType().GetMethod("Recalculate", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+                recalc?.Invoke(mgr, null);
             }
             catch { }
         }
